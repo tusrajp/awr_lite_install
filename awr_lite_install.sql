@@ -2,14 +2,29 @@
 --  awr_lite : An Oracle AWR-style workload repository for
 --             Amazon RDS for PostgreSQL and Amazon Aurora PostgreSQL
 --
---  INSTALLATION: Run this entire script ONCE, connected to the database that
---                will host the repository (referred to as appdb).
+--  INSTALLATION
+--    1. Make sure pg_stat_statements and pg_cron are in shared_preload_libraries
+--       and the instance has been rebooted.
+--    2. Create (or choose) the database that will host the repository, and
+--       create the pg_stat_statements extension INSIDE that database:
 --
---  IMPORTANT: The database you install this into MUST be the same database
---             your pg_cron jobs target. See the scheduling section at the end.
+--         CREATE DATABASE appdb;                        -- if it does not exist
+--         \c appdb
+--         CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 --
---  Requires: pg_stat_statements in shared_preload_libraries
---            PostgreSQL 14+ recommended (13 supported, see NOTE markers)
+--    3. While still connected to that database, run this script once:
+--
+--         \i awr_lite_install.sql
+--
+--  IMPORTANT: The database you install into MUST be the same database your
+--             pg_cron jobs target. See the scheduling notes at the end.
+--
+--  VERSION SUPPORT: PostgreSQL 12 through 18. The collector detects the server
+--  version at run time and adapts, so no manual editing is required.
+--    - PG12          : uses pg_stat_statements.total_time
+--    - PG13 and up   : uses pg_stat_statements.total_exec_time
+--    - PG14 and up   : captures DB time, WAL statistics, and pg_stat_activity.query_id
+--    - PG17 and up   : reads checkpoint counters from pg_stat_checkpointer
 -- ============================================================================
 
 CREATE SCHEMA IF NOT EXISTS awr_lite;
@@ -17,6 +32,8 @@ REVOKE ALL ON SCHEMA awr_lite FROM PUBLIC;
 
 -- ----------------------------------------------------------------------------
 -- 1. REPOSITORY TABLES
+--    Columns that only exist on newer servers are always present here; they
+--    are simply left NULL when the server does not provide them.
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS awr_lite.snapshots (
@@ -41,7 +58,6 @@ CREATE TABLE IF NOT EXISTS awr_lite.stat_statements (
 CREATE INDEX IF NOT EXISTS stat_statements_snap_idx
     ON awr_lite.stat_statements (snap_id, queryid);
 
--- NOTE (PostgreSQL 13): omit sessions/session_time/active_time/idle_in_transaction_time
 CREATE TABLE IF NOT EXISTS awr_lite.stat_database (
     snap_id        bigint NOT NULL REFERENCES awr_lite.snapshots(snap_id) ON DELETE CASCADE,
     datname        text,
@@ -59,10 +75,10 @@ CREATE TABLE IF NOT EXISTS awr_lite.stat_database (
     deadlocks      bigint,
     blk_read_time  double precision,
     blk_write_time double precision,
-    sessions                 bigint,
-    session_time             double precision,
-    active_time              double precision,
-    idle_in_transaction_time double precision
+    sessions                 bigint,            -- PG14+
+    session_time             double precision,  -- PG14+
+    active_time              double precision,  -- PG14+
+    idle_in_transaction_time double precision   -- PG14+
 );
 
 CREATE TABLE IF NOT EXISTS awr_lite.stat_tables (
@@ -108,11 +124,10 @@ CREATE TABLE IF NOT EXISTS awr_lite.stat_bgwriter (
     checkpoints_req    bigint,
     buffers_checkpoint bigint,
     buffers_clean      bigint,
-    buffers_backend    bigint,
+    buffers_backend    bigint,   -- NULL on PG17+
     buffers_alloc      bigint
 );
 
--- NOTE (PostgreSQL 13): pg_stat_wal does not exist; this table stays empty
 CREATE TABLE IF NOT EXISTS awr_lite.stat_wal (
     snap_id     bigint NOT NULL REFERENCES awr_lite.snapshots(snap_id) ON DELETE CASCADE,
     wal_records bigint,
@@ -138,14 +153,14 @@ CREATE TABLE IF NOT EXISTS awr_lite.active_session_samples (
     wait_event_type text,
     wait_event      text,
     backend_type    text,
-    query_id        bigint,
+    query_id        bigint,     -- PG14+
     query           text
 );
 CREATE INDEX IF NOT EXISTS ash_time_idx  ON awr_lite.active_session_samples (sample_time);
 CREATE INDEX IF NOT EXISTS ash_query_idx ON awr_lite.active_session_samples (query_id);
 
 -- ----------------------------------------------------------------------------
--- 2. SNAPSHOT COLLECTOR
+-- 2. COLLECTORS  (version-aware: no manual editing needed on any version)
 -- ----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION awr_lite.take_snapshot()
@@ -153,29 +168,52 @@ RETURNS bigint AS $fn$
 DECLARE
     v_snap_id bigint;
     v_dbid    oid := (SELECT oid FROM pg_database WHERE datname = current_database());
+    v_ver     int := current_setting('server_version_num')::int;
 BEGIN
     INSERT INTO awr_lite.snapshots DEFAULT VALUES RETURNING snap_id INTO v_snap_id;
 
-    INSERT INTO awr_lite.stat_statements
-        (snap_id, userid, queryid, query, calls, total_exec_time, rows,
-         shared_blks_hit, shared_blks_read, temp_blks_read, temp_blks_written)
-    SELECT v_snap_id, userid, queryid, left(query, 1000), calls,
-           total_exec_time, rows, shared_blks_hit, shared_blks_read,
-           temp_blks_read, temp_blks_written
-      FROM pg_stat_statements WHERE dbid = v_dbid;
+    ------------------------------------------------------------------ statements
+    -- PG13+ exposes total_exec_time; PG12 exposes total_time.
+    EXECUTE format($q$
+        INSERT INTO awr_lite.stat_statements
+            (snap_id, userid, queryid, query, calls, total_exec_time, rows,
+             shared_blks_hit, shared_blks_read, temp_blks_read, temp_blks_written)
+        SELECT %s, userid, queryid, left(query, 1000), calls, %I, rows,
+               shared_blks_hit, shared_blks_read, temp_blks_read, temp_blks_written
+          FROM pg_stat_statements WHERE dbid = %s
+    $q$, v_snap_id,
+         CASE WHEN v_ver >= 130000 THEN 'total_exec_time' ELSE 'total_time' END,
+         v_dbid);
 
-    -- NOTE (PostgreSQL 13): remove the last four columns from both lists
-    INSERT INTO awr_lite.stat_database
-        (snap_id, datname, xact_commit, xact_rollback, blks_read, blks_hit,
-         tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
-         temp_files, temp_bytes, deadlocks, blk_read_time, blk_write_time,
-         sessions, session_time, active_time, idle_in_transaction_time)
-    SELECT v_snap_id, datname, xact_commit, xact_rollback, blks_read, blks_hit,
-           tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
-           temp_files, temp_bytes, deadlocks, blk_read_time, blk_write_time,
-           sessions, session_time, active_time, idle_in_transaction_time
-      FROM pg_stat_database WHERE datname = current_database();
+    ------------------------------------------------------------------ database
+    -- Session/DB-time columns were added in PG14.
+    IF v_ver >= 140000 THEN
+        EXECUTE format($q$
+            INSERT INTO awr_lite.stat_database
+                (snap_id, datname, xact_commit, xact_rollback, blks_read, blks_hit,
+                 tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+                 temp_files, temp_bytes, deadlocks, blk_read_time, blk_write_time,
+                 sessions, session_time, active_time, idle_in_transaction_time)
+            SELECT %s, datname, xact_commit, xact_rollback, blks_read, blks_hit,
+                   tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+                   temp_files, temp_bytes, deadlocks, blk_read_time, blk_write_time,
+                   sessions, session_time, active_time, idle_in_transaction_time
+              FROM pg_stat_database WHERE datname = current_database()
+        $q$, v_snap_id);
+    ELSE
+        EXECUTE format($q$
+            INSERT INTO awr_lite.stat_database
+                (snap_id, datname, xact_commit, xact_rollback, blks_read, blks_hit,
+                 tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+                 temp_files, temp_bytes, deadlocks, blk_read_time, blk_write_time)
+            SELECT %s, datname, xact_commit, xact_rollback, blks_read, blks_hit,
+                   tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted,
+                   temp_files, temp_bytes, deadlocks, blk_read_time, blk_write_time
+              FROM pg_stat_database WHERE datname = current_database()
+        $q$, v_snap_id);
+    END IF;
 
+    ------------------------------------------------------------------ tables
     INSERT INTO awr_lite.stat_tables
         (snap_id, relid, schemaname, relname, seq_scan, seq_tup_read, idx_scan,
          idx_tup_fetch, n_tup_ins, n_tup_upd, n_tup_del, n_live_tup, n_dead_tup,
@@ -187,6 +225,7 @@ BEGIN
       FROM pg_stat_user_tables t
       JOIN pg_statio_user_tables io ON io.relid = t.relid;
 
+    ------------------------------------------------------------------ indexes
     INSERT INTO awr_lite.stat_indexes
         (snap_id, indexrelid, schemaname, relname, indexrelname,
          idx_scan, idx_tup_read, idx_tup_fetch, idx_blks_read, idx_blks_hit)
@@ -195,22 +234,39 @@ BEGIN
       FROM pg_stat_user_indexes i
       JOIN pg_statio_user_indexes io ON io.indexrelid = i.indexrelid;
 
-    -- NOTE (PostgreSQL 17+): checkpoint counters moved to pg_stat_checkpointer.
-    -- Replace this INSERT with:
-    --   SELECT v_snap_id, c.num_timed, c.num_requested, c.buffers_written,
-    --          b.buffers_clean, NULL, b.buffers_alloc
-    --     FROM pg_stat_checkpointer c CROSS JOIN pg_stat_bgwriter b;
-    INSERT INTO awr_lite.stat_bgwriter
-        (snap_id, checkpoints_timed, checkpoints_req, buffers_checkpoint,
-         buffers_clean, buffers_backend, buffers_alloc)
-    SELECT v_snap_id, checkpoints_timed, checkpoints_req, buffers_checkpoint,
-           buffers_clean, buffers_backend, buffers_alloc
-      FROM pg_stat_bgwriter;
+    ------------------------------------------------------------------ bgwriter
+    -- PG17 moved checkpoint counters to pg_stat_checkpointer and dropped
+    -- buffers_backend from pg_stat_bgwriter.
+    IF v_ver >= 170000 THEN
+        EXECUTE format($q$
+            INSERT INTO awr_lite.stat_bgwriter
+                (snap_id, checkpoints_timed, checkpoints_req, buffers_checkpoint,
+                 buffers_clean, buffers_backend, buffers_alloc)
+            SELECT %s, c.num_timed, c.num_requested, c.buffers_written,
+                   b.buffers_clean, NULL, b.buffers_alloc
+              FROM pg_stat_checkpointer c CROSS JOIN pg_stat_bgwriter b
+        $q$, v_snap_id);
+    ELSE
+        EXECUTE format($q$
+            INSERT INTO awr_lite.stat_bgwriter
+                (snap_id, checkpoints_timed, checkpoints_req, buffers_checkpoint,
+                 buffers_clean, buffers_backend, buffers_alloc)
+            SELECT %s, checkpoints_timed, checkpoints_req, buffers_checkpoint,
+                   buffers_clean, buffers_backend, buffers_alloc
+              FROM pg_stat_bgwriter
+        $q$, v_snap_id);
+    END IF;
 
-    -- NOTE (PostgreSQL 13): remove this INSERT (pg_stat_wal does not exist)
-    INSERT INTO awr_lite.stat_wal (snap_id, wal_records, wal_fpi, wal_bytes)
-    SELECT v_snap_id, wal_records, wal_fpi, wal_bytes FROM pg_stat_wal;
+    ------------------------------------------------------------------ WAL
+    -- pg_stat_wal was added in PG14. Skip silently on older servers.
+    IF v_ver >= 140000 AND to_regclass('pg_catalog.pg_stat_wal') IS NOT NULL THEN
+        EXECUTE format($q$
+            INSERT INTO awr_lite.stat_wal (snap_id, wal_records, wal_fpi, wal_bytes)
+            SELECT %s, wal_records, wal_fpi, wal_bytes FROM pg_stat_wal
+        $q$, v_snap_id);
+    END IF;
 
+    ------------------------------------------------------------------ settings
     INSERT INTO awr_lite.stat_settings (snap_id, name, setting, unit)
     SELECT v_snap_id, name, setting, unit FROM pg_settings;
 
@@ -220,25 +276,32 @@ $fn$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION awr_lite.sample_activity()
 RETURNS integer AS $fn$
-DECLARE v_rows integer;
+DECLARE
+    v_rows integer;
+    v_ver  int := current_setting('server_version_num')::int;
 BEGIN
-    INSERT INTO awr_lite.active_session_samples
-        (datname, usename, client_addr, state, wait_event_type, wait_event,
-         backend_type, query_id, query)
-    SELECT datname, usename, client_addr, state, wait_event_type, wait_event,
-           backend_type, query_id, left(query, 500)
-      FROM pg_stat_activity
-     WHERE pid <> pg_backend_pid()
-       AND state IS DISTINCT FROM 'idle'
-       AND backend_type = 'client backend';
+    -- pg_stat_activity.query_id was added in PG14.
+    EXECUTE format($q$
+        INSERT INTO awr_lite.active_session_samples
+            (datname, usename, client_addr, state, wait_event_type, wait_event,
+             backend_type, query_id, query)
+        SELECT datname, usename, client_addr, state, wait_event_type, wait_event,
+               backend_type, %s, left(query, 500)
+          FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid()
+           AND state IS DISTINCT FROM 'idle'
+           AND backend_type = 'client backend'
+    $q$, CASE WHEN v_ver >= 140000 THEN 'query_id' ELSE 'NULL::bigint' END);
     GET DIAGNOSTICS v_rows = ROW_COUNT;
     RETURN v_rows;
 END;
 $fn$ LANGUAGE plpgsql;
 
 -- ----------------------------------------------------------------------------
--- 3. SECTION FUNCTIONS (called by awr_lite.report(); also usable directly
---    when you want native tabular output for one section)
+-- 3. SECTION FUNCTIONS
+--    These read only the awr_lite tables, so they are version independent.
+--    awr_lite.report() calls them; you can also call any of them directly
+--    when you want native tabular output for a single section.
 -- ----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION awr_lite.list_snapshots(p_days int DEFAULT 2)
@@ -377,11 +440,11 @@ RETURNS TABLE (queryid bigint, username text, calls bigint,
       LEFT JOIN pg_roles r ON r.oid = e.userid
      WHERE e.snap_id = p_end AND (b.snap_id IS NULL OR e.calls >= b.calls)
      ORDER BY CASE lower(p_order)
-                WHEN 'calls' THEN (e.calls - COALESCE(b.calls,0))
-                WHEN 'rows'  THEN (e.rows - COALESCE(b.rows,0))
-                WHEN 'reads' THEN (e.shared_blks_read - COALESCE(b.shared_blks_read,0))
+                WHEN 'calls' THEN (e.calls - COALESCE(b.calls,0))::double precision
+                WHEN 'rows'  THEN (e.rows - COALESCE(b.rows,0))::double precision
+                WHEN 'reads' THEN (e.shared_blks_read - COALESCE(b.shared_blks_read,0))::double precision
                 WHEN 'temp'  THEN ((e.temp_blks_read - COALESCE(b.temp_blks_read,0)) +
-                                   (e.temp_blks_written - COALESCE(b.temp_blks_written,0)))
+                                   (e.temp_blks_written - COALESCE(b.temp_blks_written,0)))::double precision
                 ELSE (e.total_exec_time - COALESCE(b.total_exec_time,0))
               END DESC NULLS LAST
      LIMIT p_limit;
@@ -489,8 +552,8 @@ $fn$ LANGUAGE sql;
 -- ----------------------------------------------------------------------------
 -- 4. THE REPORT ENTRY POINT  (this is the only function you normally call)
 --
---    SELECT awr_lite.report(<begin_snap>, <end_snap>);
---    SELECT awr_lite.report(<begin_snap>, <end_snap>, 'TOPSQL');
+--      SELECT * FROM awr_lite.list_snapshots();     -- find your window
+--      SELECT awr_lite.report(<begin>, <end>);      -- generate the report
 --
 --    Sections: ALL (default), HEADER, LOAD, SUMMARY, TOPSQL, SEGMENTS,
 --              INDEXES, BGWRITER, WAL, ASH, SOURCES, PARAMS
@@ -506,7 +569,7 @@ DECLARE
     r     record;
     sec   text    := upper(coalesce(p_section, 'ALL'));
     v_all boolean := (sec = 'ALL');
-    W     int     := 118;   -- report width
+    W     int     := 118;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM awr_lite.snapshots WHERE snap_id = p_begin) THEN
         RETURN NEXT format('ERROR: begin snapshot %s not found. Run: SELECT * FROM awr_lite.list_snapshots();', p_begin);
@@ -577,9 +640,6 @@ BEGIN
         RETURN NEXT repeat('-', W);
         RETURN NEXT format('  %14s %10s %12s %12s %7s %-14s %s',
                            'Elapsed(ms)','Calls','Avg(ms)','Rows','Hit%','User','SQL');
-        RETURN NEXT format('  %14s %10s %12s %12s %7s %-14s %s',
-                           repeat('-',14),repeat('-',10),repeat('-',12),repeat('-',12),
-                           repeat('-',7),repeat('-',14),repeat('-',40));
         FOR r IN SELECT * FROM awr_lite.report_top_sql(p_begin, p_end, p_limit) LOOP
             RETURN NEXT format('  %14s %10s %12s %12s %7s %-14s %s',
                 r.total_exec_time_ms, r.calls, coalesce(r.mean_exec_time_ms::text,'-'),
@@ -589,7 +649,7 @@ BEGIN
         RETURN NEXT '';
 
         RETURN NEXT repeat('-', W);
-        RETURN NEXT '  SQL ORDERED BY BLOCK READS (logical/physical reads)';
+        RETURN NEXT '  SQL ORDERED BY BLOCK READS';
         RETURN NEXT repeat('-', W);
         RETURN NEXT format('  %14s %12s %10s %-14s %s', 'Blk Reads','Elapsed(ms)','Calls','User','SQL');
         FOR r IN SELECT * FROM awr_lite.report_top_sql_by(p_begin, p_end, 'reads', p_limit) LOOP
@@ -611,7 +671,7 @@ BEGIN
         RETURN NEXT '';
 
         RETURN NEXT repeat('-', W);
-        RETURN NEXT '  SQL ORDERED BY TEMP BLOCK USAGE (sort/hash spills)';
+        RETURN NEXT '  SQL ORDERED BY TEMP BLOCK USAGE';
         RETURN NEXT repeat('-', W);
         RETURN NEXT format('  %12s %14s %12s %-14s %s', 'Temp Blks','Elapsed(ms)','Calls','User','SQL');
         FOR r IN SELECT * FROM awr_lite.report_top_sql_by(p_begin, p_end, 'temp', p_limit) LOOP
@@ -628,11 +688,11 @@ BEGIN
         RETURN NEXT repeat('-', W);
         RETURN NEXT '  SEGMENTS BY PHYSICAL READS';
         RETURN NEXT repeat('-', W);
-        RETURN NEXT format('  %-20s %-28s %12s %12s %7s %10s %10s %10s',
+        RETURN NEXT format('  %-18s %-26s %12s %12s %7s %10s %10s %10s',
                            'Schema','Table','Blk Reads','Blk Hits','Hit%','Seq Scans','Idx Scans','Dead Tup');
         FOR r IN SELECT * FROM awr_lite.report_top_tables(p_begin, p_end, p_limit) LOOP
-            RETURN NEXT format('  %-20s %-28s %12s %12s %7s %10s %10s %10s',
-                left(r.schemaname,20), left(r.relname,28), r.phys_blk_reads, r.blk_hits,
+            RETURN NEXT format('  %-18s %-26s %12s %12s %7s %10s %10s %10s',
+                left(r.schemaname,18), left(r.relname,26), r.phys_blk_reads, r.blk_hits,
                 coalesce(r.cache_hit_pct::text,'-'), r.seq_scans, r.idx_scans, r.dead_tup);
         END LOOP;
         RETURN NEXT '';
@@ -640,23 +700,23 @@ BEGIN
         RETURN NEXT repeat('-', W);
         RETURN NEXT '  SEGMENTS BY DML ACTIVITY';
         RETURN NEXT repeat('-', W);
-        RETURN NEXT format('  %-20s %-28s %14s %14s %14s',
+        RETURN NEXT format('  %-18s %-26s %14s %14s %14s',
                            'Schema','Table','Inserts','Updates','Deletes');
         FOR r IN SELECT * FROM awr_lite.report_top_tables(p_begin, p_end, p_limit) LOOP
             CONTINUE WHEN (r.ins + r.upd + r.del) = 0;
-            RETURN NEXT format('  %-20s %-28s %14s %14s %14s',
-                left(r.schemaname,20), left(r.relname,28), r.ins, r.upd, r.del);
+            RETURN NEXT format('  %-18s %-26s %14s %14s %14s',
+                left(r.schemaname,18), left(r.relname,26), r.ins, r.upd, r.del);
         END LOOP;
         RETURN NEXT '';
     END IF;
 
-    ---------------------------------------------------------------- UNUSED INDEXES
+    ---------------------------------------------------------------- INDEXES
     IF v_all OR sec = 'INDEXES' THEN
         RETURN NEXT repeat('-', W);
         RETURN NEXT '  INDEXES WITH NO SCANS IN THIS INTERVAL';
         RETURN NEXT repeat('-', W);
         FOR r IN SELECT * FROM awr_lite.report_unused_indexes(p_begin, p_end) LOOP
-            RETURN NEXT format('  %-20s %-30s %s', left(r.schemaname,20), left(r.relname,30), r.indexrelname);
+            RETURN NEXT format('  %-18s %-30s %s', left(r.schemaname,18), left(r.relname,30), r.indexrelname);
         END LOOP;
         RETURN NEXT '  (Evaluate over a long window before dropping any index.)';
         RETURN NEXT '';
@@ -683,11 +743,12 @@ BEGIN
         RETURN NEXT repeat('-', W);
         RETURN NEXT '  WAL / REDO ACTIVITY';
         RETURN NEXT repeat('-', W);
-        FOR r IN SELECT * FROM awr_lite.report_wal(p_begin, p_end) LOOP
-            RETURN NEXT format('  WAL records: %s   Full page images: %s   WAL bytes (redo size): %s',
-                               r.wal_records, r.wal_fpi, r.wal_bytes);
-        END LOOP;
-        IF NOT EXISTS (SELECT 1 FROM awr_lite.stat_wal WHERE snap_id = p_end) THEN
+        IF EXISTS (SELECT 1 FROM awr_lite.stat_wal WHERE snap_id = p_end) THEN
+            FOR r IN SELECT * FROM awr_lite.report_wal(p_begin, p_end) LOOP
+                RETURN NEXT format('  WAL records: %s   Full page images: %s   WAL bytes (redo size): %s',
+                                   r.wal_records, r.wal_fpi, r.wal_bytes);
+            END LOOP;
+        ELSE
             RETURN NEXT '  (No WAL statistics captured - requires PostgreSQL 14 or higher.)';
         END IF;
         RETURN NEXT '';
@@ -708,11 +769,11 @@ BEGIN
                           AND sample_time <  (SELECT snap_time FROM awr_lite.snapshots WHERE snap_id = p_end)) THEN
             RETURN NEXT '  (No samples in this interval. Schedule awr_lite.sample_activity() to populate.)';
         END IF;
-        RETURN NEXT '  Note: NULL wait event is reported as CPU. Sampling approximates time.';
+        RETURN NEXT '  Note: a NULL wait event is reported as CPU. Sampling approximates time.';
         RETURN NEXT '';
     END IF;
 
-    ---------------------------------------------------------------- SQL SOURCES
+    ---------------------------------------------------------------- SOURCES
     IF v_all OR sec = 'SOURCES' THEN
         RETURN NEXT repeat('-', W);
         RETURN NEXT '  SQL BY USER AND CLIENT ADDRESS (sampled)';
@@ -723,12 +784,12 @@ BEGIN
                 r.query_id, left(coalesce(r.usename,'?'),18),
                 left(coalesce(r.client_addr::text,'local'),18), r.samples, left(r.sample_query,40));
         END LOOP;
-        RETURN NEXT '  Note: requires PostgreSQL 14+. Shows the address the server sees';
-        RETURN NEXT '        (an RDS Proxy / NAT / bastion address if one is in the path).';
+        RETURN NEXT '  Note: requires PostgreSQL 14+. Shows the address the server sees, which is';
+        RETURN NEXT '        an RDS Proxy / NAT / bastion address if one is in the connection path.';
         RETURN NEXT '';
     END IF;
 
-    ---------------------------------------------------------------- PARAMETERS
+    ---------------------------------------------------------------- PARAMS
     IF v_all OR sec = 'PARAMS' THEN
         RETURN NEXT repeat('-', W);
         RETURN NEXT '  PARAMETERS CHANGED BETWEEN SNAPSHOTS';
@@ -752,7 +813,7 @@ $fn$ LANGUAGE plpgsql;
 -- ============================================================================
 --  INSTALLATION COMPLETE
 --
---  Next steps (run from the postgres database, targeting THIS database):
+--  Schedule the collectors from the postgres database, targeting THIS database:
 --
 --    SELECT cron.schedule_in_database('awr_lite_snapshot','*/15 * * * *',
 --           $$SELECT awr_lite.take_snapshot();$$, '<this_database>');
@@ -763,9 +824,11 @@ $fn$ LANGUAGE plpgsql;
 --             DELETE FROM awr_lite.active_session_samples WHERE sample_time < now() - interval '8 days';$$,
 --           '<this_database>');
 --
---  Then, to use it:
---    SELECT * FROM awr_lite.list_snapshots();       -- find your window
---    SELECT awr_lite.report(<begin>, <end>);        -- generate the report
+--  Confirm the jobs actually run (look for status = succeeded):
+--    SELECT jobid, database, status, return_message, start_time
+--      FROM cron.job_run_details ORDER BY start_time DESC LIMIT 10;
+--
+--  Then use it:
+--    SELECT * FROM awr_lite.list_snapshots();
+--    SELECT awr_lite.report(<begin>, <end>);
 -- ============================================================================
-
-
